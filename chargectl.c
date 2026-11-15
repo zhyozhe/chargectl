@@ -1,4 +1,4 @@
-// chargectl v6 — Chromebook 充電キープ・ミニアプリの本体
+// chargectl v7 — Chromebook 充電キープ・ミニアプリの本体
 // 役割: (1) 選んだ保持%を覚える (2) ectool で Battery Sustainer に適用する
 //       (3) 再起動などで既定(80%)に戻されていたら入れ直す (4) 操作画面を出す
 // 画面は http://127.0.0.1:8765/ （この機械の中だけ）。外部には開かない。
@@ -36,6 +36,9 @@
 //     この機種の current_now は放電中でも正の大きさで返る（実測: 放電中
 //     +614mA）ため、生値の符号は信用せず status を見て付け替える。
 //     電力は大きさの話なので絶対値で計算する（画面側）。
+// v7 の変更点 (2026-11-16):
+//   - 電流と電池状態の文字に色を付ける: 充電中は緑、放電中はオレンジ、
+//     それ以外は通常色。Ampere のような電池アプリの流儀に合わせた。
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -391,12 +394,15 @@ static const char *PAGE =
 "async function refresh(){try{const r= await fetch('/api/state');const s= await r.json();"
 "document.getElementById('st').innerHTML="
 "'現在の電池: '+(s.battery>=0?s.battery+'%':'不明')+'<br>'"
-"+'電圧: '+(s.elec?(s.voltage_mv/1000).toFixed(2)+' V':'不明')+'　電流: '+(s.elec?((s.current_ma>=0?'+':'')+s.current_ma)+' mA':'不明')+'　電力: '+(s.elec?(s.voltage_mv*Math.abs(s.current_ma)/1000000).toFixed(1)+' W':'不明')+'<br>'"
-"+'電池の残量: '+(s.charge_mah>=0?s.charge_mah+' mAh':'不明')+'　状態: '+stLabel(s.bat_status)+'<br>'"
+"+'電圧: '+(s.elec?(s.voltage_mv/1000).toFixed(2)+' V':'不明')+'　電流: <span id=cur>'+(s.elec?((s.current_ma>=0?'+':'')+s.current_ma)+' mA':'不明')+'</span>　電力: '+(s.elec?(s.voltage_mv*Math.abs(s.current_ma)/1000000).toFixed(1)+' W':'不明')+'<br>'"
+"+'電池の残量: '+(s.charge_mah>=0?s.charge_mah+' mAh':'不明')+'　状態: <span id=bst>'+stLabel(s.bat_status)+'</span><br>'"
 "+'保持の状態: '+((s.known===false)?'不明（読み取り失敗）':(s.on?('有効（'+s.lower+'%〜'+s.upper+'%）'):'無効（満充電）'))+'<br>'"
 "+'選んでいる値: '+(s.target>0?s.target+'%':'未設定')+'<br>'"
 "+'充電速度の上限: '+(s.speed===0?'無制限':s.speed+' mA')+'<br>'"
 "+'見回り周期: '+ivLabel(s.interval);"
+"const col=s.bat_status==='Charging'?'#4caf50':(s.bat_status==='Discharging'?'#ff9800':'#ccc');"
+"const ce=document.getElementById('cur');if(ce)ce.style.color=col;"
+"const be=document.getElementById('bst');if(be)be.style.color=col;"
 "CHOICES.forEach(n=>{document.getElementById('b'+n).classList.toggle('active',s.target===n);});"
 "SPD_CHOICES.forEach(v=>{document.getElementById('s'+v).classList.toggle('active',s.speed===v);});"
 "INT_CHOICES.forEach(v=>{document.getElementById('i'+v).classList.toggle('active',s.interval===v);});"
@@ -499,7 +505,7 @@ static void handle_client(int fd) {
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     mkdir(STATE_DIR, 0755);
-    log_msg("chargectl v6 starting (interval=%d, speed=%d)", load_interval(), load_speed());
+    log_msg("chargectl v7 starting (interval=%d, speed=%d)", load_interval(), load_speed());
     keeper();
     time_t last_keeper = time(NULL);
 
