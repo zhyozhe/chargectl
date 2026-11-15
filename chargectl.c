@@ -1,4 +1,4 @@
-// chargectl v2 — Chromebook 充電キープ・ミニアプリの本体
+// chargectl v5 — Chromebook 充電キープ・ミニアプリの本体
 // 役割: (1) 選んだ保持%を覚える (2) ectool で Battery Sustainer に適用する
 //       (3) 再起動などで既定(80%)に戻されていたら入れ直す (4) 操作画面を出す
 // 画面は http://127.0.0.1:8765/ （この機械の中だけ）。外部には開かない。
@@ -25,6 +25,13 @@
 //     変わったときと失敗時だけ出す。
 //   - 実効は実測済み: 上限500を書くと充電電流 1269mA→491mA に落ち、
 //     無制限（4294967295、powerd と同じ値）を書くと約1300mA に戻った。
+// v5 の変更点 (2026-11-16):
+//   - 画面の状態表示に電気量を追加: 電圧(V)・電流(mA)・電力(W)・残量(mAh)・
+//     電池の状態（充電中/放電中など）。電池の状態ファイル
+//     （/sys/class/power_supply/BAT*/ の voltage_now / current_now /
+//     charge_now / status）を読むだけの表示専用で、制御には一切使わない。
+//   - 電力は power_now が無い機種向けに電圧×電流で計算する。
+//     電流の符号は機種で違うので、大きさは絶対値で出し、向きは status で示す。
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -148,6 +155,63 @@ static int read_battery_percent(void) {
         closedir(d);
     }
     return -1;
+}
+
+// 文字列ファイルを読む（末尾の改行は落とす）。電池の status 用。
+static int read_file_str(const char *path, char *out, size_t cap) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    size_t n = fread(out, 1, cap - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = '\0';
+    return 0;
+}
+
+// 電池の電気量を読む（表示専用）。電圧 mV・電流 mA・残量 mAh・状態文字列。
+// 読めない項目は -1（状態は空文字）。電池ディレクトリは voltage_now を
+// 持つものを探し、名前が BAT で始まるものを優先する（マウス等の電池と
+// 取り違えないため）。
+static void read_battery_elec(int *mv, int *ma, int *mah, char *status, size_t scap) {
+    *mv = -1; *ma = -1; *mah = -1;
+    if (scap > 0) status[0] = '\0';
+    char dir[256] = "";
+    DIR *d = opendir("/sys/class/power_supply");
+    if (!d) return;
+    struct dirent *e;
+    char fallback[256] = "";
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char path[512];
+        snprintf(path, sizeof(path), "/sys/class/power_supply/%s/voltage_now", e->d_name);
+        if (access(path, R_OK) != 0) continue;
+        if (strncmp(e->d_name, "BAT", 3) == 0) {
+            snprintf(dir, sizeof(dir), "/sys/class/power_supply/%s", e->d_name);
+            break;
+        }
+        if (fallback[0] == '\0')
+            snprintf(fallback, sizeof(fallback), "/sys/class/power_supply/%s", e->d_name);
+    }
+    closedir(d);
+    if (dir[0] == '\0') snprintf(dir, sizeof(dir), "%s", fallback);
+    if (dir[0] == '\0') return;
+    char path[512];
+    int uv, ua, uah;
+    snprintf(path, sizeof(path), "%s/voltage_now", dir);
+    if (read_file_int(path, &uv) == 0) *mv = uv / 1000;
+    snprintf(path, sizeof(path), "%s/current_now", dir);
+    if (read_file_int(path, &ua) == 0) *ma = ua / 1000;
+    snprintf(path, sizeof(path), "%s/charge_now", dir);
+    if (read_file_int(path, &uah) == 0) *mah = uah / 1000;
+    snprintf(path, sizeof(path), "%s/status", dir);
+    char raw[64];
+    if (read_file_str(path, raw, sizeof(raw)) == 0 && scap > 0) {
+        // JSON に埋めるので英数と空白以外は落とす
+        size_t j = 0;
+        for (size_t i = 0; raw[i] && j < scap - 1; i++)
+            if (isalnum((unsigned char)raw[i]) || raw[i] == ' ') status[j++] = raw[i];
+        status[j] = '\0';
+    }
 }
 
 static int load_target(void) {
@@ -309,6 +373,7 @@ static const char *PAGE =
 "const SPD_CHOICES=[500,1000,2000,3000,0];"
 "const INT_CHOICES=[30,60,300,600];"
 "function ivLabel(s){return s<60?s+'秒':(s/60)+'分';}"
+"function stLabel(t){return {'Charging':'充電中','Discharging':'放電中','Full':'満充電','Not charging':'充電停止中','Unknown':'不明'}[t]||t||'不明';}"
 "function spdLabel(v){return v===0?'無制限':v+'';}"
 "const btns=document.getElementById('btns');"
 "CHOICES.forEach(n=>{const b=document.createElement('button');b.textContent=n+'%';"
@@ -322,6 +387,8 @@ static const char *PAGE =
 "async function refresh(){try{const r= await fetch('/api/state');const s= await r.json();"
 "document.getElementById('st').innerHTML="
 "'現在の電池: '+(s.battery>=0?s.battery+'%':'不明')+'<br>'"
+"+'電圧: '+(s.elec?(s.voltage_mv/1000).toFixed(2)+' V':'不明')+'　電流: '+(s.elec?Math.abs(s.current_ma)+' mA':'不明')+'　電力: '+(s.elec?(s.voltage_mv*Math.abs(s.current_ma)/1000000).toFixed(1)+' W':'不明')+'<br>'"
+"+'電池の残量: '+(s.charge_mah>=0?s.charge_mah+' mAh':'不明')+'　状態: '+stLabel(s.bat_status)+'<br>'"
 "+'保持の状態: '+((s.known===false)?'不明（読み取り失敗）':(s.on?('有効（'+s.lower+'%〜'+s.upper+'%）'):'無効（満充電）'))+'<br>'"
 "+'選んでいる値: '+(s.target>0?s.target+'%':'未設定')+'<br>'"
 "+'充電速度の上限: '+(s.speed===0?'無制限':s.speed+' mA')+'<br>'"
@@ -343,9 +410,14 @@ static void state_json(char *out, size_t cap) {
     int target = load_target();
     int interval = load_interval();
     int speed = load_speed();
+    int mv, ma, mah; char bat_status[32];
+    read_battery_elec(&mv, &ma, &mah, bat_status, sizeof(bat_status));
+    int elec = (mv >= 0 && ma >= 0) ? 1 : 0;
     snprintf(out, cap,
-             "{\"target\":%d,\"known\":%s,\"on\":%s,\"lower\":%d,\"upper\":%d,\"battery\":%d,\"interval\":%d,\"speed\":%d}",
-             target, known ? "true" : "false", on ? "true" : "false", lo, hi, batt, interval, speed);
+             "{\"target\":%d,\"known\":%s,\"on\":%s,\"lower\":%d,\"upper\":%d,\"battery\":%d,\"interval\":%d,\"speed\":%d,"
+             "\"elec\":%s,\"voltage_mv\":%d,\"current_ma\":%d,\"charge_mah\":%d,\"bat_status\":\"%s\"}",
+             target, known ? "true" : "false", on ? "true" : "false", lo, hi, batt, interval, speed,
+             elec ? "true" : "false", mv, ma, mah, bat_status);
 }
 
 static void respond(int fd, const char *status, const char *ctype, const char *body) {
@@ -375,7 +447,7 @@ static void handle_client(int fd) {
         log_msg("api/set v=%d", v);
         save_target(v);
         apply_target(v);
-        char js[256]; state_json(js, sizeof(js));
+        char js[768]; state_json(js, sizeof(js));
         respond(fd, "200 OK", "application/json", js);
         return;
     }
@@ -389,7 +461,7 @@ static void handle_client(int fd) {
         log_msg("api/speed ma=%d", v);
         save_speed(v);
         apply_speed(v);
-        char js[320]; state_json(js, sizeof(js));
+        char js[768]; state_json(js, sizeof(js));
         respond(fd, "200 OK", "application/json", js);
         return;
     }
@@ -402,12 +474,12 @@ static void handle_client(int fd) {
         if (!valid) { respond(fd, "400 Bad Request", "text/plain", "bad value"); return; }
         log_msg("api/interval sec=%d", v);
         save_interval(v);
-        char js[256]; state_json(js, sizeof(js));
+        char js[768]; state_json(js, sizeof(js));
         respond(fd, "200 OK", "application/json", js);
         return;
     }
     if (strncmp(path, "/api/state", 10) == 0) {
-        char js[256]; state_json(js, sizeof(js));
+        char js[768]; state_json(js, sizeof(js));
         respond(fd, "200 OK", "application/json", js);
         return;
     }
@@ -421,7 +493,7 @@ static void handle_client(int fd) {
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     mkdir(STATE_DIR, 0755);
-    log_msg("chargectl v4 starting (interval=%d, speed=%d)", load_interval(), load_speed());
+    log_msg("chargectl v5 starting (interval=%d, speed=%d)", load_interval(), load_speed());
     keeper();
     time_t last_keeper = time(NULL);
 
