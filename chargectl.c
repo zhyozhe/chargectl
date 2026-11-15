@@ -1,4 +1,4 @@
-// chargectl v5 — Chromebook 充電キープ・ミニアプリの本体
+// chargectl v6 — Chromebook 充電キープ・ミニアプリの本体
 // 役割: (1) 選んだ保持%を覚える (2) ectool で Battery Sustainer に適用する
 //       (3) 再起動などで既定(80%)に戻されていたら入れ直す (4) 操作画面を出す
 // 画面は http://127.0.0.1:8765/ （この機械の中だけ）。外部には開かない。
@@ -31,7 +31,11 @@
 //     （/sys/class/power_supply/BAT*/ の voltage_now / current_now /
 //     charge_now / status）を読むだけの表示専用で、制御には一切使わない。
 //   - 電力は power_now が無い機種向けに電圧×電流で計算する。
-//     電流の符号は機種で違うので、大きさは絶対値で出し、向きは status で示す。
+// v6 の変更点 (2026-11-16):
+//   - 電流の符号を状態で正規化する: 充電中は＋、放電中は−で表示する。
+//     この機種の current_now は放電中でも正の大きさで返る（実測: 放電中
+//     +614mA）ため、生値の符号は信用せず status を見て付け替える。
+//     電力は大きさの話なので絶対値で計算する（画面側）。
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -387,7 +391,7 @@ static const char *PAGE =
 "async function refresh(){try{const r= await fetch('/api/state');const s= await r.json();"
 "document.getElementById('st').innerHTML="
 "'現在の電池: '+(s.battery>=0?s.battery+'%':'不明')+'<br>'"
-"+'電圧: '+(s.elec?(s.voltage_mv/1000).toFixed(2)+' V':'不明')+'　電流: '+(s.elec?Math.abs(s.current_ma)+' mA':'不明')+'　電力: '+(s.elec?(s.voltage_mv*Math.abs(s.current_ma)/1000000).toFixed(1)+' W':'不明')+'<br>'"
+"+'電圧: '+(s.elec?(s.voltage_mv/1000).toFixed(2)+' V':'不明')+'　電流: '+(s.elec?((s.current_ma>=0?'+':'')+s.current_ma)+' mA':'不明')+'　電力: '+(s.elec?(s.voltage_mv*Math.abs(s.current_ma)/1000000).toFixed(1)+' W':'不明')+'<br>'"
 "+'電池の残量: '+(s.charge_mah>=0?s.charge_mah+' mAh':'不明')+'　状態: '+stLabel(s.bat_status)+'<br>'"
 "+'保持の状態: '+((s.known===false)?'不明（読み取り失敗）':(s.on?('有効（'+s.lower+'%〜'+s.upper+'%）'):'無効（満充電）'))+'<br>'"
 "+'選んでいる値: '+(s.target>0?s.target+'%':'未設定')+'<br>'"
@@ -413,6 +417,8 @@ static void state_json(char *out, size_t cap) {
     int mv, ma, mah; char bat_status[32];
     read_battery_elec(&mv, &ma, &mah, bat_status, sizeof(bat_status));
     int elec = (mv >= 0 && ma >= 0) ? 1 : 0;
+    // 電流の符号は状態で付け替える（v6）: 充電中=＋、放電中=−
+    if (elec && strcmp(bat_status, "Discharging") == 0) ma = -ma;
     snprintf(out, cap,
              "{\"target\":%d,\"known\":%s,\"on\":%s,\"lower\":%d,\"upper\":%d,\"battery\":%d,\"interval\":%d,\"speed\":%d,"
              "\"elec\":%s,\"voltage_mv\":%d,\"current_ma\":%d,\"charge_mah\":%d,\"bat_status\":\"%s\"}",
@@ -493,7 +499,7 @@ static void handle_client(int fd) {
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     mkdir(STATE_DIR, 0755);
-    log_msg("chargectl v5 starting (interval=%d, speed=%d)", load_interval(), load_speed());
+    log_msg("chargectl v6 starting (interval=%d, speed=%d)", load_interval(), load_speed());
     keeper();
     time_t last_keeper = time(NULL);
 
