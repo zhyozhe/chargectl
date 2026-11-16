@@ -1,4 +1,4 @@
-// chargectl v7 — Chromebook 充電キープ・ミニアプリの本体
+// chargectl v8 — Chromebook 充電キープ・ミニアプリの本体
 // 役割: (1) 選んだ保持%を覚える (2) ectool で Battery Sustainer に適用する
 //       (3) 再起動などで既定(80%)に戻されていたら入れ直す (4) 操作画面を出す
 // 画面は http://127.0.0.1:8765/ （この機械の中だけ）。外部には開かない。
@@ -39,6 +39,10 @@
 // v7 の変更点 (2026-11-16):
 //   - 電流と電池状態の文字に色を付ける: 充電中は緑、放電中はオレンジ、
 //     それ以外は通常色。Ampere のような電池アプリの流儀に合わせた。
+// v8 の変更点 (2026-11-16):
+//   - 入力側（充電器側）の電圧も表示する。CROS_USBPD_CHARGER* の
+//     voltage_now と online を読む。ただしこれは EC が報告する入力側の
+//     実測値で、USB PD の契約電圧の額面（5/9/15/20V）ではない。
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -221,6 +225,26 @@ static void read_battery_elec(int *mv, int *ma, int *mah, char *status, size_t s
     }
 }
 
+// 入力側（充電器側）の電圧を読む（表示専用）。CROS_USBPD_CHARGER* の
+// voltage_now（mV）と online を返す。充電器が無い/読めない場合は -1。
+static void read_input_elec(int *mv, int *online) {
+    *mv = -1; *online = 0;
+    DIR *d = opendir("/sys/class/power_supply");
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strstr(e->d_name, "USBPD_CHARGER") == NULL) continue;
+        char path[512];
+        int uv, on;
+        snprintf(path, sizeof(path), "/sys/class/power_supply/%s/online", e->d_name);
+        if (read_file_int(path, &on) == 0) *online = on;
+        snprintf(path, sizeof(path), "/sys/class/power_supply/%s/voltage_now", e->d_name);
+        if (read_file_int(path, &uv) == 0) *mv = uv / 1000;
+        break;
+    }
+    closedir(d);
+}
+
 static int load_target(void) {
     int v;
     if (read_file_int(TARGET_FILE, &v) != 0) return -1;
@@ -395,7 +419,7 @@ static const char *PAGE =
 "document.getElementById('st').innerHTML="
 "'現在の電池: '+(s.battery>=0?s.battery+'%':'不明')+'<br>'"
 "+'電圧: '+(s.elec?(s.voltage_mv/1000).toFixed(2)+' V':'不明')+'　電流: <span id=cur>'+(s.elec?((s.current_ma>=0?'+':'')+s.current_ma)+' mA':'不明')+'</span>　電力: '+(s.elec?(s.voltage_mv*Math.abs(s.current_ma)/1000000).toFixed(1)+' W':'不明')+'<br>'"
-"+'電池の残量: '+(s.charge_mah>=0?s.charge_mah+' mAh':'不明')+'　状態: <span id=bst>'+stLabel(s.bat_status)+'</span><br>'"
+"+'電池の残量: '+(s.charge_mah>=0?s.charge_mah+' mAh':'不明')+'　状態: <span id=bst>'+stLabel(s.bat_status)+'</span>　入力電圧: '+(s.input_online?(s.input_mv>=0?(s.input_mv/1000).toFixed(2)+' V':'不明'):'なし')+'<br>'"
 "+'保持の状態: '+((s.known===false)?'不明（読み取り失敗）':(s.on?('有効（'+s.lower+'%〜'+s.upper+'%）'):'無効（満充電）'))+'<br>'"
 "+'選んでいる値: '+(s.target>0?s.target+'%':'未設定')+'<br>'"
 "+'充電速度の上限: '+(s.speed===0?'無制限':s.speed+' mA')+'<br>'"
@@ -425,11 +449,15 @@ static void state_json(char *out, size_t cap) {
     int elec = (mv >= 0 && ma >= 0) ? 1 : 0;
     // 電流の符号は状態で付け替える（v6）: 充電中=＋、放電中=−
     if (elec && strcmp(bat_status, "Discharging") == 0) ma = -ma;
+    int input_mv, input_online;
+    read_input_elec(&input_mv, &input_online);
     snprintf(out, cap,
              "{\"target\":%d,\"known\":%s,\"on\":%s,\"lower\":%d,\"upper\":%d,\"battery\":%d,\"interval\":%d,\"speed\":%d,"
-             "\"elec\":%s,\"voltage_mv\":%d,\"current_ma\":%d,\"charge_mah\":%d,\"bat_status\":\"%s\"}",
+             "\"elec\":%s,\"voltage_mv\":%d,\"current_ma\":%d,\"charge_mah\":%d,\"bat_status\":\"%s\","
+             "\"input_mv\":%d,\"input_online\":%s}",
              target, known ? "true" : "false", on ? "true" : "false", lo, hi, batt, interval, speed,
-             elec ? "true" : "false", mv, ma, mah, bat_status);
+             elec ? "true" : "false", mv, ma, mah, bat_status,
+             input_mv, input_online ? "true" : "false");
 }
 
 static void respond(int fd, const char *status, const char *ctype, const char *body) {
@@ -505,7 +533,7 @@ static void handle_client(int fd) {
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     mkdir(STATE_DIR, 0755);
-    log_msg("chargectl v7 starting (interval=%d, speed=%d)", load_interval(), load_speed());
+    log_msg("chargectl v8 starting (interval=%d, speed=%d)", load_interval(), load_speed());
     keeper();
     time_t last_keeper = time(NULL);
 
